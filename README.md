@@ -9,4 +9,4 @@ differentials
 
 usage like
 
-  ./malloc_run.sh <command>
+  ./malloc_run.sh &lt;command&gt;
