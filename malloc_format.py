@@ -11,6 +11,7 @@ import re
 import sys
 import Queue
 import threading
+from collections import defaultdict
 
 OUTPUT_PREFIX = "|||||||||||||||||||||| "
 
@@ -29,12 +30,14 @@ def process(stream):
     sizes = {}
     current_total = 0
     last_total = 0
+    modules = defaultdict(lambda: 0)
 
-    malloc_re = re.compile(r'^malloc\(([0-9]+)\) = (.*)\n$')
-    free_re = re.compile(r'^free\((.*)\)\n$')
-    realloc_re = re.compile(r'^realloc\(([^,]*), ([0-9]+)\) = (.*)\n$')
-    calloc_re = re.compile(r'^calloc\(([0-9]+), ([0-9]+)\) = (.*)\n$')
+    malloc_re = re.compile(r'^(.+)\(.+: malloc\(([0-9]+)\) = (.*)\n$')
+    free_re = re.compile(r'^(.+)\(.+: free\((.*)\)\n$')
+    realloc_re = re.compile(r'^(.+)\(.+: realloc\(([^,]*), ([0-9]+)\) = (.*)\n$')
+    calloc_re = re.compile(r'^(.+)\(.+: calloc\(([0-9]+), ([0-9]+)\) = (.*)\n$')
 
+    lines = 0
     while True:
         try:
             line = queue.get(timeout=1.0)
@@ -47,40 +50,54 @@ def process(stream):
                 sys.stdout.write("diff: %d bytes\n" % diff)
             if line is not None:
                 sys.stdout.write(line)
+            sys.stdout.write('>>>>> MODULES BEGIN >>>>>\n');
+            for k,v in modules.iteritems():
+                sys.stdout.write('  module %s has %d outstanding bytes\n' %
+                    (k, v))
+            sys.stdout.write('<<<<<< MODULES END <<<<<\n');
             continue
         line = line[len(OUTPUT_PREFIX):]
         match = malloc_re.match(line)
         if match:
-            size = int(match.group(1))
-            address = match.group(2)
+            caller = match.group(1)
+            size = int(match.group(2))
+            address = match.group(3)
+            modules[caller] += size;
             current_total += size
             sizes[address] = size
             continue
         match = free_re.match(line)
         if match:
-            address = match.group(1)
+            caller = match.group(1)
+            address = match.group(2)
             if address in sizes:
                 size = sizes[address]
                 current_total -= size
+                modules[caller] -= size;
                 del sizes[address]
             continue
         match = realloc_re.match(line)
         if match:
-            old_address = match.group(1)
+            caller = match.group(1)
+            old_address = match.group(2)
             if old_address in sizes:
                 size = sizes[old_address]
                 current_total -= size
+                modules[caller] -= size;
                 del sizes[old_address]
-            size = int(match.group(2))
-            new_address = match.group(3)
+            size = int(match.group(3))
+            new_address = match.group(4)
             current_total += size
+            modules[caller] += size;
             sizes[new_address] = size
             continue
         match = calloc_re.match(line)
         if match:
-            size = int(match.group(1)) * int(match.group(2))
-            address = match.group(3)
+            caller = match.group(1)
+            size = int(match.group(2)) * int(match.group(3))
+            address = match.group(4)
             current_total += size
+            modules[caller] += size;
             sizes[address] = size
             continue
         sys.stdout.write("unhandled malloc line: %s" % line)

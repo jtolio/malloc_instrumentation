@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <execinfo.h>
 
 //
 // This LD_PRELOAD library instruments malloc, calloc, realloc, memalign,
@@ -76,6 +77,30 @@ void* dummy_calloc(size_t nmemb, size_t size) {
 void dummy_free(void *ptr) {
 }
 
+void dump_prefix() {
+    // IMPORTANT: if you change where this is called from, you may need to
+    // adjust the depth so that we get the correct caller.
+    //
+    // TODO: detect our module address and search backwards until we hit
+    // somebody else
+    const size_t our_depth = 2;
+    const size_t caller_depth = our_depth + 1;
+    void *array[caller_depth];
+    size_t size;
+    char **caller;
+    size_t i;
+
+    size = backtrace (array, caller_depth);
+    if (size > our_depth) {
+      caller = backtrace_symbols (array + our_depth, 1);
+      fprintf(stderr, OUTPUT_PREFIX "%s: ", *caller);
+      free (caller);
+    } else {
+      fprintf(stderr, OUTPUT_PREFIX "err: ");
+    }
+
+}
+
 int start_call() {
     pthread_mutex_lock(&init_mutex);
     if (!initializing) {
@@ -128,7 +153,6 @@ int start_call() {
         pthread_mutex_unlock(&internal_mutex);
         return 1;
     }
-
     internal = 1;
     return 0;
 }
@@ -141,17 +165,20 @@ void end_call() {
 void* malloc(size_t size) {
     if (start_call()) return real_malloc(size);
     void *rv = NULL;
-    fprintf(stderr, OUTPUT_PREFIX "malloc(%zu) = ", size);
+    dump_prefix();
+    fprintf(stderr, "malloc(%zu) = ", size);
     rv = real_malloc(size);
     fprintf(stderr, "%p\n", rv);
     end_call();
+
     return rv;
 }
 
 void* calloc(size_t nmemb, size_t size) {
     if (start_call()) return real_calloc(nmemb, size);
     void *p = NULL;
-    fprintf(stderr, OUTPUT_PREFIX "calloc(%zu, %zu) = ", nmemb, size);
+    dump_prefix();
+    fprintf(stderr, "calloc(%zu, %zu) = ", nmemb, size);
     p = real_calloc(nmemb, size);
     fprintf(stderr, "%p\n", p);
     end_call();
@@ -161,7 +188,8 @@ void* calloc(size_t nmemb, size_t size) {
 void* realloc(void *ptr, size_t size) {
     if (start_call()) return real_realloc(ptr, size);
     void *p = NULL;
-    fprintf(stderr, OUTPUT_PREFIX "realloc(%p, %zu) = ", ptr, size);
+    dump_prefix();
+    fprintf(stderr, "realloc(%p, %zu) = ", ptr, size);
     p = real_realloc(ptr, size);
     fprintf(stderr, "%p\n", p);
     end_call();
@@ -174,9 +202,11 @@ void free(void *ptr) {
         return;
     }
 
-    fprintf(stderr, OUTPUT_PREFIX "free(%p)\n", ptr);
+    dump_prefix();
+    fprintf(stderr, "free(%p)\n", ptr);
     real_free(ptr);
     end_call();
+
     return;
 }
 
@@ -184,7 +214,8 @@ void* memalign(size_t blocksize, size_t bytes) {
     if (start_call()) return real_memalign(blocksize, bytes);
 
     void *p = NULL;
-    fprintf(stderr, OUTPUT_PREFIX "memalign(%zu, %zu) = ", blocksize,
+    dump_prefix();
+    fprintf(stderr, "memalign(%zu, %zu) = ", blocksize,
             bytes);
     p = real_memalign(blocksize, bytes);
     fprintf(stderr, "%p\n", p);
@@ -196,7 +227,8 @@ int posix_memalign(void** memptr, size_t alignment, size_t size) {
     if (start_call()) return real_posix_memalign(memptr, alignment, size);
 
     int rv = 0;
-    fprintf(stderr, OUTPUT_PREFIX "posix_memalign(%p, %zu, %zu) = ",
+    dump_prefix();
+    fprintf(stderr, "posix_memalign(%p, %zu, %zu) = ",
             memptr, alignment, size);
     rv = real_posix_memalign(memptr, alignment, size);
     if (rv == 0) {
@@ -212,7 +244,8 @@ void* valloc(size_t size) {
     if (start_call()) return real_valloc(size);
 
     void *p = NULL;
-    fprintf(stderr, OUTPUT_PREFIX "valloc(%zu) = ", size);
+    dump_prefix();
+    fprintf(stderr, "valloc(%zu) = ", size);
     p = real_valloc(size);
     fprintf(stderr, "%p\n", p);
     end_call();
