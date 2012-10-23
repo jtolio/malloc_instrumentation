@@ -3,7 +3,6 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <execinfo.h>
 
 //
@@ -26,7 +25,7 @@
 // -JT Olds <jt@spacemonkey.com>
 //
 
-// gcc -shared -fPIC -o malloc_instrument.so malloc_instrument.c -lpthread -ldl
+// gcc -shared -fPIC -o malloc_instrument.so malloc_instrument.c -ldl
 
 #define OUTPUT_PREFIX "|||||||||||||||||||||| "
 
@@ -38,6 +37,7 @@ static void* (*real_valloc)(size_t size);
 static int   (*real_posix_memalign)(void** memptr, size_t alignment,
                                      size_t size);
 static void  (*real_free)(void *ptr);
+
 static void* (*temp_malloc)(size_t size);
 static void* (*temp_calloc)(size_t nmemb, size_t size);
 static void* (*temp_realloc)(void *ptr, size_t size);
@@ -47,12 +47,15 @@ static int   (*temp_posix_memalign)(void** memptr, size_t alignment,
                                      size_t size);
 static void  (*temp_free)(void *ptr);
 
-pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t internal_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutexattr_t internal_mutex_attr;
-int initializing = 0;
-int initialized = 0;
-int internal = 0;
+__thread unsigned int entered = 0;
+
+int start_call() {
+  return __sync_fetch_and_add(&entered, 1);
+}
+
+void end_call() {
+  __sync_fetch_and_sub(&entered, 1);
+}
 
 char tmpbuf[1024];
 unsigned long tmppos = 0;
@@ -77,177 +80,267 @@ void* dummy_calloc(size_t nmemb, size_t size) {
 void dummy_free(void *ptr) {
 }
 
-void dump_prefix() {
-    // IMPORTANT: if you change where this is called from, you may need to
-    // adjust the depth so that we get the correct caller.
-    //
-    // TODO: detect our module address and search backwards until we hit
-    // somebody else
-    const size_t our_depth = 2;
+void __attribute__((constructor)) hookfns() {
+    start_call();
+    real_malloc         = dummy_malloc;
+    real_calloc         = dummy_calloc;
+    real_realloc        = NULL;
+    real_free           = dummy_free;
+    real_memalign       = NULL;
+    real_valloc         = NULL;
+    real_posix_memalign = NULL;
+
+    temp_malloc         = dlsym(RTLD_NEXT, "malloc");
+    temp_calloc         = dlsym(RTLD_NEXT, "calloc");
+    temp_realloc        = dlsym(RTLD_NEXT, "realloc");
+    temp_free           = dlsym(RTLD_NEXT, "free");
+    temp_memalign       = dlsym(RTLD_NEXT, "memalign");
+    temp_valloc         = dlsym(RTLD_NEXT, "valloc");
+    temp_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+
+    if (!temp_malloc || !temp_calloc || !temp_realloc || !temp_memalign ||
+        !temp_valloc || !temp_posix_memalign || !temp_free)
+    {
+        fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
+        exit(1);
+    }
+
+    real_malloc         = temp_malloc;
+    real_calloc         = temp_calloc;
+    real_realloc        = temp_realloc;
+    real_free           = temp_free;
+    real_memalign       = temp_memalign;
+    real_valloc         = temp_valloc;
+    real_posix_memalign = temp_posix_memalign;
+    end_call();
+}
+
+
+
+typedef struct record_tag {
+  enum alloc_type {
+    MALLOC_CALL,
+    CALLOC_CALL,
+    REALLOC_CALL,
+    MEMALIGN_CALL,
+    VALLOC_CALL,
+    POSIX_MEMALIGN_CALL,
+    FREE_CALL
+  } type;
+
+  union {
+    struct {
+      size_t size;
+      void* ptr;
+    } malloc_call;
+
+    struct {
+      size_t nmemb;
+      size_t size;
+      void* ptr;
+    } calloc_call;
+
+    struct {
+      void* in_ptr;
+      size_t size;
+      void* out_ptr;
+    } realloc_call;
+
+    struct {
+      size_t blocksize;
+      size_t bytes;
+      void* ptr;
+    } memalign_call;
+
+    struct {
+      size_t size;
+      void* ptr;
+    } valloc_call;
+
+    struct {
+      void** memptr;
+      size_t alignment;
+      size_t size;
+      int rv;
+      void* ptr;
+    } posix_memalign_call;
+
+    struct {
+      void* ptr;
+    } free_call;
+  };
+} call_record;
+
+void* get_caller() {
+    const size_t our_depth = 3;
     const size_t caller_depth = our_depth + 1;
     void *array[caller_depth];
-    size_t size;
-    char **caller;
-    size_t i;
-
-    size = backtrace (array, caller_depth);
+    size_t size = backtrace(array, caller_depth);
     if (size > our_depth) {
-      caller = backtrace_symbols (array + our_depth, 1);
-      fprintf(stderr, OUTPUT_PREFIX "%s: ", *caller);
-      free (caller);
-    } else {
-      fprintf(stderr, OUTPUT_PREFIX "err: ");
+        return array[our_depth];
     }
-
+    return NULL;
 }
 
-int start_call() {
-    pthread_mutex_lock(&init_mutex);
-    if (!initializing) {
-        initializing = 1;
-        pthread_mutexattr_init(&internal_mutex_attr);
-        pthread_mutexattr_settype(&internal_mutex_attr,
-                PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&internal_mutex, &internal_mutex_attr);
-        pthread_mutex_lock(&internal_mutex);
-        pthread_mutex_unlock(&init_mutex);
+void do_call(call_record *record) {
+    int internal = 0;
+    char **symbol = NULL;
+    char *caller = NULL;
 
-        real_malloc         = dummy_malloc;
-        real_calloc         = dummy_calloc;
-        real_realloc        = NULL;
-        real_free           = dummy_free;
-        real_memalign       = NULL;
-        real_valloc         = NULL;
-        real_posix_memalign = NULL;
+    internal = start_call();
 
-        temp_malloc         = dlsym(RTLD_NEXT, "malloc");
-        temp_calloc         = dlsym(RTLD_NEXT, "calloc");
-        temp_realloc        = dlsym(RTLD_NEXT, "realloc");
-        temp_free           = dlsym(RTLD_NEXT, "free");
-        temp_memalign       = dlsym(RTLD_NEXT, "memalign");
-        temp_valloc         = dlsym(RTLD_NEXT, "valloc");
-        temp_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
-
-        if (!temp_malloc || !temp_calloc || !temp_realloc || !temp_memalign ||
-            !temp_valloc || !temp_posix_memalign || !temp_free)
-        {
-            fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
-            exit(1);
+    if (!internal) {
+        void* calling_func = get_caller();
+        if (calling_func) {
+            symbol = backtrace_symbols(&calling_func, 1);
+            if (symbol) {
+                caller = *symbol;
+            }
         }
-
-        real_malloc         = temp_malloc;
-        real_calloc         = temp_calloc;
-        real_realloc        = temp_realloc;
-        real_free           = temp_free;
-        real_memalign       = temp_memalign;
-        real_valloc         = temp_valloc;
-        real_posix_memalign = temp_posix_memalign;
-
-        initialized = 1;
-    } else {
-        pthread_mutex_unlock(&init_mutex);
-        pthread_mutex_lock(&internal_mutex);
     }
 
-    if (!initialized || internal) {
-        pthread_mutex_unlock(&internal_mutex);
-        return 1;
+    if (!caller) {
+        caller = "UNK";
     }
-    internal = 1;
-    return 0;
-}
 
-void end_call() {
-    internal = 0;
-    pthread_mutex_unlock(&internal_mutex);
+#define DUMPLINE(fmt, ...) if (!internal) fprintf(stderr, \
+        "|||||||||||||||||||||| %s: " fmt "\n", caller, __VA_ARGS__);
+
+    switch(record->type) {
+        case MALLOC_CALL:
+        record->malloc_call.ptr = real_malloc(record->malloc_call.size);
+        DUMPLINE("malloc(%zu) = %p",
+                record->malloc_call.size,
+                record->malloc_call.ptr);
+        break;
+        case CALLOC_CALL:
+        record->calloc_call.ptr = real_calloc(
+                record->calloc_call.nmemb,
+                record->calloc_call.size);
+        DUMPLINE("calloc(%zu, %zu) = %p",
+                record->calloc_call.nmemb,
+                record->calloc_call.size,
+                record->calloc_call.ptr);
+        break;
+        case REALLOC_CALL:
+        record->realloc_call.out_ptr = real_realloc(
+                record->realloc_call.in_ptr,
+                record->realloc_call.size);
+        DUMPLINE("realloc(%p, %zu) = %p",
+                record->realloc_call.in_ptr,
+                record->realloc_call.size,
+                record->realloc_call.out_ptr);
+        break;
+        case MEMALIGN_CALL:
+        record->memalign_call.ptr = real_memalign(
+                record->memalign_call.blocksize,
+                record->memalign_call.bytes);
+        DUMPLINE("memalign(%zu, %zu) = %p",
+                record->memalign_call.blocksize,
+                record->memalign_call.bytes,
+                record->memalign_call.ptr);
+        break;
+        case VALLOC_CALL:
+        record->valloc_call.ptr = real_valloc(
+                record->valloc_call.size);
+        DUMPLINE("valloc(%zu) = %p",
+                record->valloc_call.size,
+                record->valloc_call.ptr);
+        break;
+        case POSIX_MEMALIGN_CALL:
+        record->posix_memalign_call.rv = real_posix_memalign(
+                record->posix_memalign_call.memptr,
+                record->posix_memalign_call.alignment,
+                record->posix_memalign_call.size);
+        if (record->posix_memalign_call.rv == 0) {
+            DUMPLINE("posix_memalign(%p, %zu, %zu) = 0, %p",
+                    record->posix_memalign_call.memptr,
+                    record->posix_memalign_call.alignment,
+                    record->posix_memalign_call.size,
+                    *record->posix_memalign_call.memptr);
+        } else {
+            DUMPLINE("posix_memalign(%p, %zu, %zu) = %d, NULL",
+                    record->posix_memalign_call.memptr,
+                    record->posix_memalign_call.alignment,
+                    record->posix_memalign_call.size,
+                    record->posix_memalign_call.rv);
+        }
+        break;
+        case FREE_CALL:
+        real_free(record->free_call.ptr);
+        DUMPLINE("free(%p)", record->free_call.ptr);
+        break;
+    };
+
+    if (symbol) {
+        free(symbol);
+    }
+
+    end_call();
 }
 
 void* malloc(size_t size) {
-    if (start_call()) return real_malloc(size);
-    void *rv = NULL;
-    dump_prefix();
-    fprintf(stderr, "malloc(%zu) = ", size);
-    rv = real_malloc(size);
-    fprintf(stderr, "%p\n", rv);
-    end_call();
+    call_record record;
+    record.type = MALLOC_CALL;
+    record.malloc_call.size = size;
+    do_call(&record);
 
-    return rv;
+    return record.malloc_call.ptr;
 }
 
 void* calloc(size_t nmemb, size_t size) {
-    if (start_call()) return real_calloc(nmemb, size);
-    void *p = NULL;
-    dump_prefix();
-    fprintf(stderr, "calloc(%zu, %zu) = ", nmemb, size);
-    p = real_calloc(nmemb, size);
-    fprintf(stderr, "%p\n", p);
-    end_call();
-    return p;
+    call_record record;
+    record.type = CALLOC_CALL;
+    record.calloc_call.nmemb = nmemb;
+    record.calloc_call.size = size;
+    do_call(&record);
+
+    return record.calloc_call.ptr;
 }
 
 void* realloc(void *ptr, size_t size) {
-    if (start_call()) return real_realloc(ptr, size);
-    void *p = NULL;
-    dump_prefix();
-    fprintf(stderr, "realloc(%p, %zu) = ", ptr, size);
-    p = real_realloc(ptr, size);
-    fprintf(stderr, "%p\n", p);
-    end_call();
-    return p;
+    call_record record;
+    record.type = REALLOC_CALL;
+    record.realloc_call.in_ptr = ptr;
+    record.realloc_call.size = size;
+    do_call(&record);
+
+    return record.realloc_call.out_ptr;
 }
 
 void free(void *ptr) {
-    if (start_call()) {
-        real_free(ptr);
-        return;
-    }
-
-    dump_prefix();
-    fprintf(stderr, "free(%p)\n", ptr);
-    real_free(ptr);
-    end_call();
-
-    return;
+    call_record record;
+    record.type = FREE_CALL;
+    record.free_call.ptr = ptr;
+    do_call(&record);
 }
 
 void* memalign(size_t blocksize, size_t bytes) {
-    if (start_call()) return real_memalign(blocksize, bytes);
+    call_record record;
+    record.type = MEMALIGN_CALL;
+    record.memalign_call.blocksize = blocksize;
+    record.memalign_call.bytes = bytes;
+    do_call(&record);
 
-    void *p = NULL;
-    dump_prefix();
-    fprintf(stderr, "memalign(%zu, %zu) = ", blocksize,
-            bytes);
-    p = real_memalign(blocksize, bytes);
-    fprintf(stderr, "%p\n", p);
-    end_call();
-    return p;
+    return record.memalign_call.ptr;
 }
 
 int posix_memalign(void** memptr, size_t alignment, size_t size) {
-    if (start_call()) return real_posix_memalign(memptr, alignment, size);
+    call_record record;
+    record.type = MEMALIGN_CALL;
+    record.posix_memalign_call.memptr = memptr;
+    record.posix_memalign_call.alignment = alignment;
+    record.posix_memalign_call.size = size;
+    do_call(&record);
 
-    int rv = 0;
-    dump_prefix();
-    fprintf(stderr, "posix_memalign(%p, %zu, %zu) = ",
-            memptr, alignment, size);
-    rv = real_posix_memalign(memptr, alignment, size);
-    if (rv == 0) {
-        fprintf(stderr, "0, %p\n", *memptr);
-    } else {
-        fprintf(stderr, "%d, NULL\n", rv);
-    }
-    end_call();
-    return rv;
+    return record.posix_memalign_call.rv;
 }
 
 void* valloc(size_t size) {
-    if (start_call()) return real_valloc(size);
+    call_record record;
+    record.type = VALLOC_CALL;
+    record.valloc_call.size = size;
+    do_call(&record);
 
-    void *p = NULL;
-    dump_prefix();
-    fprintf(stderr, "valloc(%zu) = ", size);
-    p = real_valloc(size);
-    fprintf(stderr, "%p\n", p);
-    end_call();
-    return p;
+    return record.valloc_call.ptr;
 }
