@@ -15,6 +15,10 @@ from collections import defaultdict
 
 OUTPUT_PREFIX = "|||||||||||||||||||||| "
 
+class Allocation:
+    def __init__(self, size, module):
+        self.size = size
+        self.module = module
 
 def process(stream):
     queue = Queue.Queue()
@@ -28,16 +32,16 @@ def process(stream):
     thread.daemon = True
     thread.start()
 
-    sizes = {}
+    allocations = {}
     current_total = 0
     last_total = 0
     module_snapshot = defaultdict(lambda: 0)
     modules = defaultdict(lambda: 0)
 
-    malloc_re = re.compile(r'^(.+)\(.+: malloc\(([0-9]+)\) = (.*)\n$')
-    free_re = re.compile(r'^(.+)\(.+: free\((.*)\)\n$')
-    realloc_re = re.compile(r'^(.+)\(.+: realloc\(([^,]*), ([0-9]+)\) = (.*)\n$')
-    calloc_re = re.compile(r'^(.+)\(.+: calloc\(([0-9]+), ([0-9]+)\) = (.*)\n$')
+    malloc_re = re.compile(r'^\[[^]]+\]: (.+)\(.+: malloc\(([0-9]+)\) = (.*)\n$')
+    free_re = re.compile(r'^\[[^]]+\]: (.+)\(.+: free\((.*)\)\n$')
+    realloc_re = re.compile(r'^\[[^]]+\]: (.+)\(.+: realloc\(([^,]*), ([0-9]+)\) = (.*)\n$')
+    calloc_re = re.compile(r'^\[[^]]+\]: (.+)\(.+: calloc\(([0-9]+), ([0-9]+)\) = (.*)\n$')
 
     lines = 0
     exited = False
@@ -48,6 +52,8 @@ def process(stream):
                 exited = True
         except Queue.Empty:
             line = None
+        if line is not None and line.startswith("  >>"):
+            continue
         if line is None or line[:len(OUTPUT_PREFIX)] != OUTPUT_PREFIX:
             diff = current_total - last_total
             last_total = current_total
@@ -72,32 +78,32 @@ def process(stream):
             address = match.group(3)
             modules[caller] += size;
             current_total += size
-            sizes[address] = size
+            allocations[address] = Allocation(size, caller)
             continue
         match = free_re.match(line)
         if match:
             caller = match.group(1)
             address = match.group(2)
-            if address in sizes:
-                size = sizes[address]
-                current_total -= size
-                modules[caller] -= size;
-                del sizes[address]
+            allocation = allocations.get(address, None)
+            if allocation:
+                current_total -= allocation.size
+                modules[caller] -= allocation.size;
+                del allocations[address]
             continue
         match = realloc_re.match(line)
         if match:
             caller = match.group(1)
             old_address = match.group(2)
-            if old_address in sizes:
-                size = sizes[old_address]
-                current_total -= size
-                modules[caller] -= size;
-                del sizes[old_address]
+            old_allocation = allocations.get(old_address, None)
+            if old_allocation:
+                current_total -= old_allocation.size
+                modules[old_allocation.module] -= old_allocation.size;
+                del allocations[old_address]
             size = int(match.group(3))
             new_address = match.group(4)
             current_total += size
             modules[caller] += size;
-            sizes[new_address] = size
+            allocations[new_address] = Allocation(size, caller)
             continue
         match = calloc_re.match(line)
         if match:
@@ -106,10 +112,14 @@ def process(stream):
             address = match.group(4)
             current_total += size
             modules[caller] += size;
-            sizes[address] = size
+            allocations[address] = Allocation(size, caller)
             continue
         sys.stdout.write("unhandled malloc line: %s\n" % line)
     sys.stdout.write("-- allocated at exit: %d bytes\n" % current_total)
+    modules = defaultdict(lambda: 0)
+    for k, v in allocations.iteritems():
+        sys.stdout.write("unfreed %s (%s): %d bytes\n" % (k, v.module, v.size))
+        modules[v.module] += v.size
     for k, v in modules.iteritems():
         sys.stdout.write("-- allocated by %s at exit: %d bytes\n" % (k, v))
 

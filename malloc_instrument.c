@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <execinfo.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 
 //
 // This LD_PRELOAD library instruments malloc, calloc, realloc, memalign,
@@ -47,7 +50,13 @@ static int   (*temp_posix_memalign)(void** memptr, size_t alignment,
                                      size_t size);
 static void  (*temp_free)(void *ptr);
 
+int dump_whole_stack = 0;
+
 __thread unsigned int entered = 0;
+
+pid_t ourgettid() {
+  return syscall(SYS_gettid);
+}
 
 int start_call() {
   return __sync_fetch_and_add(&entered, 1);
@@ -112,90 +121,100 @@ void __attribute__((constructor)) hookfns() {
     real_memalign       = temp_memalign;
     real_valloc         = temp_valloc;
     real_posix_memalign = temp_posix_memalign;
+
+    if (getenv("DUMP_WHOLE_STACK")) {
+        dump_whole_stack = 1;
+    }
+
     end_call();
 }
 
 
 
 typedef struct record_tag {
-  enum alloc_type {
-    MALLOC_CALL,
-    CALLOC_CALL,
-    REALLOC_CALL,
-    MEMALIGN_CALL,
-    VALLOC_CALL,
-    POSIX_MEMALIGN_CALL,
-    FREE_CALL
-  } type;
+    enum alloc_type {
+        MALLOC_CALL,
+        CALLOC_CALL,
+        REALLOC_CALL,
+        MEMALIGN_CALL,
+        VALLOC_CALL,
+        POSIX_MEMALIGN_CALL,
+        FREE_CALL
+    } type;
 
-  union {
-    struct {
-      size_t size;
-      void* ptr;
-    } malloc_call;
+    union {
+        struct {
+            size_t size;
+            void* ptr;
+        } malloc_call;
 
-    struct {
-      size_t nmemb;
-      size_t size;
-      void* ptr;
-    } calloc_call;
+        struct {
+            size_t nmemb;
+            size_t size;
+            void* ptr;
+        } calloc_call;
 
-    struct {
-      void* in_ptr;
-      size_t size;
-      void* out_ptr;
-    } realloc_call;
+        struct {
+            void* in_ptr;
+            size_t size;
+            void* out_ptr;
+        } realloc_call;
 
-    struct {
-      size_t blocksize;
-      size_t bytes;
-      void* ptr;
-    } memalign_call;
+        struct {
+            size_t blocksize;
+            size_t bytes;
+            void* ptr;
+        } memalign_call;
 
-    struct {
-      size_t size;
-      void* ptr;
-    } valloc_call;
+        struct {
+            size_t size;
+            void* ptr;
+        } valloc_call;
 
-    struct {
-      void** memptr;
-      size_t alignment;
-      size_t size;
-      int rv;
-      void* ptr;
-    } posix_memalign_call;
+        struct {
+            void** memptr;
+            size_t alignment;
+            size_t size;
+            int rv;
+            void* ptr;
+        } posix_memalign_call;
 
-    struct {
-      void* ptr;
-    } free_call;
+        struct {
+            void* ptr;
+        } free_call;
   };
 } call_record;
 
-void* get_caller() {
+char** get_backtrace(size_t maxstacklen, size_t *psymbols) {
     const size_t our_depth = 3;
-    const size_t caller_depth = our_depth + 1;
-    void *array[caller_depth];
-    size_t size = backtrace(array, caller_depth);
-    if (size > our_depth) {
-        return array[our_depth];
+    void* stack[maxstacklen + our_depth];
+    size_t size = backtrace(stack, maxstacklen + our_depth);
+
+    *psymbols = 0;
+
+    if (size <= our_depth) {
+        return NULL;
     }
-    return NULL;
+
+    *psymbols = size - our_depth;
+    return backtrace_symbols(&stack[our_depth], size - our_depth);
 }
 
 void do_call(call_record *record) {
     int internal = 0;
-    char **symbol = NULL;
+    char **backtrace = NULL;
+    size_t backtracelen = 1;
     char *caller = NULL;
 
     internal = start_call();
 
     if (!internal) {
-        void* calling_func = get_caller();
-        if (calling_func) {
-            symbol = backtrace_symbols(&calling_func, 1);
-            if (symbol) {
-                caller = *symbol;
-            }
+        if (dump_whole_stack) {
+            backtracelen += 20;
+        }
+        backtrace = get_backtrace(backtracelen, &backtracelen);
+        if (backtrace && backtracelen > 0) {
+            caller = backtrace[0];
         }
     }
 
@@ -204,15 +223,26 @@ void do_call(call_record *record) {
     }
 
 #define DUMPLINE(fmt, ...) if (!internal) fprintf(stderr, \
-        "|||||||||||||||||||||| %s: " fmt "\n", caller, __VA_ARGS__);
+        "|||||||||||||||||||||| [%#x]: %s: " fmt "\n", ourgettid(), caller, \
+        __VA_ARGS__); \
+        if (backtracelen > 1) { \
+            pid_t tid = ourgettid(); \
+            size_t i; \
+            for (i = 0; i < backtracelen; ++i) { \
+                fprintf(stderr, "  >> [%#x] #%zu: %s\n", \
+                    tid, i, backtrace[i]); \
+            } \
+        }
 
     switch(record->type) {
+
         case MALLOC_CALL:
         record->malloc_call.ptr = real_malloc(record->malloc_call.size);
         DUMPLINE("malloc(%zu) = %p",
                 record->malloc_call.size,
                 record->malloc_call.ptr);
         break;
+
         case CALLOC_CALL:
         record->calloc_call.ptr = real_calloc(
                 record->calloc_call.nmemb,
@@ -222,6 +252,7 @@ void do_call(call_record *record) {
                 record->calloc_call.size,
                 record->calloc_call.ptr);
         break;
+
         case REALLOC_CALL:
         record->realloc_call.out_ptr = real_realloc(
                 record->realloc_call.in_ptr,
@@ -231,6 +262,7 @@ void do_call(call_record *record) {
                 record->realloc_call.size,
                 record->realloc_call.out_ptr);
         break;
+
         case MEMALIGN_CALL:
         record->memalign_call.ptr = real_memalign(
                 record->memalign_call.blocksize,
@@ -240,6 +272,7 @@ void do_call(call_record *record) {
                 record->memalign_call.bytes,
                 record->memalign_call.ptr);
         break;
+
         case VALLOC_CALL:
         record->valloc_call.ptr = real_valloc(
                 record->valloc_call.size);
@@ -247,6 +280,7 @@ void do_call(call_record *record) {
                 record->valloc_call.size,
                 record->valloc_call.ptr);
         break;
+
         case POSIX_MEMALIGN_CALL:
         record->posix_memalign_call.rv = real_posix_memalign(
                 record->posix_memalign_call.memptr,
@@ -266,14 +300,15 @@ void do_call(call_record *record) {
                     record->posix_memalign_call.rv);
         }
         break;
+
         case FREE_CALL:
         real_free(record->free_call.ptr);
         DUMPLINE("free(%p)", record->free_call.ptr);
         break;
     };
 
-    if (symbol) {
-        free(symbol);
+    if (backtrace) {
+        free(backtrace);
     }
 
     end_call();
