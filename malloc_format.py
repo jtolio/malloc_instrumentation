@@ -31,6 +31,7 @@ def process(stream):
     sizes = {}
     current_total = 0
     last_total = 0
+    module_snapshot = defaultdict(lambda: 0)
     modules = defaultdict(lambda: 0)
 
     malloc_re = re.compile(r'^(.+)\(.+: malloc\(([0-9]+)\) = (.*)\n$')
@@ -51,14 +52,17 @@ def process(stream):
             diff = current_total - last_total
             last_total = current_total
             if diff != 0:
-                sys.stdout.write("diff: %d bytes\n" % diff)
+                sys.stdout.write("-- diff: %d bytes\n" % diff)
             if line is not None:
                 sys.stdout.write(line)
-            sys.stdout.write('>>>>> MODULES BEGIN >>>>>\n');
-            for k,v in modules.iteritems():
-                sys.stdout.write('  module %s has %d outstanding bytes\n' %
-                    (k, v))
-            sys.stdout.write('<<<<<< MODULES END <<<<<\n');
+            module_diffs = defaultdict(lambda: 0)
+            for k, v in modules.iteritems():
+                diff = v - module_snapshot[k]
+                if diff != 0:
+                    module_diffs[k] = diff
+            module_snapshot = modules.copy()
+            for k, v in module_diffs.iteritems():
+                sys.stdout.write("-- diff %s: %d bytes\n" % (k, v))
             continue
         line = line[len(OUTPUT_PREFIX):]
         match = malloc_re.match(line)
@@ -104,7 +108,10 @@ def process(stream):
             modules[caller] += size;
             sizes[address] = size
             continue
-        sys.stdout.write("unhandled malloc line: %s" % line)
+        sys.stdout.write("unhandled malloc line: %s\n" % line)
+    sys.stdout.write("-- allocated at exit: %d bytes\n" % current_total)
+    for k, v in modules.iteritems():
+        sys.stdout.write("-- allocated by %s at exit: %d bytes\n" % (k, v))
 
 
 def main():
