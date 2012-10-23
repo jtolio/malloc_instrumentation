@@ -22,6 +22,7 @@ def process(stream):
     def readingThread(queue):
         for line in stream:
             queue.put(line)
+        queue.put(None)
 
     thread = threading.Thread(target=readingThread, args=(queue,))
     thread.daemon = True
@@ -38,9 +39,12 @@ def process(stream):
     calloc_re = re.compile(r'^(.+)\(.+: calloc\(([0-9]+), ([0-9]+)\) = (.*)\n$')
 
     lines = 0
-    while True:
+    exited = False
+    while not exited:
         try:
             line = queue.get(timeout=1.0)
+            if line is None:
+                exited = True
         except Queue.Empty:
             line = None
         if line is None or line[:len(OUTPUT_PREFIX)] != OUTPUT_PREFIX:
